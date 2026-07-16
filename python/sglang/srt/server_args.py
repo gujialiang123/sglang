@@ -1069,9 +1069,23 @@ class ServerArgs:
     sidecar: A[
         Optional[str],
         "Start a locally managed sidecar against the native gRPC server. "
-        "The selected module must expose main(argv). Requires --grpc-port or "
-        "SGLANG_GRPC_PORT.",
+        "The selected module must expose main(argv) and read the resolved "
+        "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
+        "or SGLANG_GRPC_PORT.",
     ] = None
+    sidecar_args: A[
+        Optional[List[str]],
+        Arg(
+            help="JSON array of arguments passed unchanged to the selected "
+            "sidecar module's main(argv) function.",
+            type_parser=json_list_type,
+        ),
+    ] = None
+    sidecar_shutdown_timeout: A[
+        float,
+        "Seconds to wait for a managed sidecar to shut down gracefully before "
+        "killing its process tree.",
+    ] = 45.0
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -3295,9 +3309,18 @@ class ServerArgs:
         # Native gRPC is incompatible with launch paths it doesn't wire into.
         # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
         native_grpc = self.grpc_port is not None and not legacy_grpc
+        if self.sidecar_args is not None:
+            if self.sidecar is None:
+                raise ValueError("--sidecar-args requires --sidecar.")
+            if not isinstance(self.sidecar_args, list) or not all(
+                isinstance(arg, str) for arg in self.sidecar_args
+            ):
+                raise ValueError("--sidecar-args must be a JSON array of strings.")
         if self.sidecar is not None:
             if not self.sidecar.strip():
                 raise ValueError("--sidecar must not be empty.")
+            if self.sidecar_shutdown_timeout <= 0:
+                raise ValueError("--sidecar-shutdown-timeout must be greater than 0.")
             if legacy_grpc:
                 raise ValueError(
                     "--sidecar requires SGLang's native gRPC server; "
