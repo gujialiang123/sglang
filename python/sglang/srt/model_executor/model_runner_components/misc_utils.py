@@ -24,17 +24,20 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+
+    from sglang.srt.runtime_context import get_context, get_schedule
+
     if (
         not use_mla_backend
         or server_args.attention_backend
         not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
     ):
-        if not server_args.disable_chunked_prefix_cache:
-            server_args.override(
+        if not get_schedule().disable_chunked_prefix_cache:
+            get_context().override(
                 "model_runner.chunked_prefix_cache_gate",
                 disable_chunked_prefix_cache=True,
             )
-    if not server_args.disable_chunked_prefix_cache:
+    if not get_schedule().disable_chunked_prefix_cache:
         logger.info("Chunked prefix cache is turned on.")
 
 

@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -640,7 +640,7 @@ class XPUAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_server_args().disable_chunked_prefix_cache
+                    assert not get_schedule().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
