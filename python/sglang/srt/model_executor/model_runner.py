@@ -1061,18 +1061,16 @@ class ModelRunner:
             return self.max_total_num_tokens
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
-        # Load-time resolution transition: the weight-resolved kv-cache dtype
-        # is declared into the flags tier; the dual-apply inside the helper
-        # replaces the legacy in-place write. Mock runners whose server_args
-        # is not the published object keep the plain write.
+        # the weight-resolved kv-cache dtype is written to the config
+        # bags via get_context().override, so get_model().kv_cache_dtype readers
+        # see it. server_args stays the pristine RAW record -- configure_kv_cache
+        # _dtype reads it as the resolver INPUT. A draft / mock runner whose
+        # server_args is not the published object keeps the private-bag write.
         from sglang.srt.runtime_context import get_context
 
         if get_context()._server_args is self.server_args:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "ModelRunner.configure_kv_cache_dtype",
-                {"kv_cache_dtype": resolved},
+            get_context().override(
+                "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
             )
         else:
             self.server_args.override(
@@ -1083,6 +1081,8 @@ class ModelRunner:
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
+                # RAW user intent = resolver INPUT; server_args stays pristine
+                # so read it here -- not the resolved get_model() bag.
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
