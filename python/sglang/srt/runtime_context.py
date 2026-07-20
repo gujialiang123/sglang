@@ -674,6 +674,7 @@ class RuntimeContext:
         "_server_args",
         "_config_bags",
         "_overrides_log",
+        "_publish_role",
         "flags",
         "resources",
         "forward",
@@ -684,6 +685,7 @@ class RuntimeContext:
         self._server_args: ServerArgs | None = None
         self._config_bags: dict | None = None
         self._overrides_log: list = []
+        self._publish_role: str | None = None
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
@@ -970,6 +972,26 @@ def get_observability() -> _ConfigBag:
     return _CONTEXT.config_bag("observability")
 
 
+def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
+    """Install process-wide config for this OS process.
+
+    Records the process ``role`` (``tokenizer`` / ``scheduler`` / ``encoder`` /
+    ``expert_backup`` / ``launcher`` / ``test``) and projects the config bags.
+    One call per process; draft workers skip publish (they must not clobber the
+    target). ``role`` is provenance today — per-role namespace projection and
+    fail-closed enforcement is a later unit. ``hf_config`` is accepted for
+    forward-compat and currently unused.
+    """
+    _CONTEXT._publish_role = role
+    _CONTEXT.set_server_args(server_args)
+    return _CONTEXT
+
+
+def publish_role() -> str | None:
+    """The role recorded by the last ``publish`` (None for a legacy set)."""
+    return _CONTEXT._publish_role
+
+
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -991,6 +1013,7 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []
+    _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
