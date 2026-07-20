@@ -878,7 +878,14 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args, port_args
             )
         else:
-            # Launch multi-tokenizer router
+            # Launch multi-tokenizer router. Unlike TokenizerManager, the router
+            # does not publish; but it runs in this parent process and reads
+            # resolved config through the namespace accessors (e.g. get_parallel()
+            # for routed_dp_rank), so publish here. The child TokenizerWorkers
+            # publish independently in their own processes.
+            from sglang.srt.runtime_context import publish
+
+            publish(server_args, role="tokenizer")
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 

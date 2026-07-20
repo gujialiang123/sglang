@@ -1086,6 +1086,15 @@ class ModelRunner:
                 ),
             )
         )
+        # This runner's OWN resolved dtype string (target or draft). Attention
+        # backends read it directly instead of the process-global get_model()
+        # bag: a draft runner does not publish its args, so the bag would carry
+        # the target's dtype and mis-drive the draft's FP8 cast/descale paths.
+        self.kv_cache_dtype_str = (
+            resolved_kv_cache_dtype
+            if resolved_kv_cache_dtype is not None
+            else self.server_args.kv_cache_dtype
+        )
         if resolved_kv_cache_dtype is not None:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
 

@@ -289,7 +289,14 @@ class TestRegisterToBootstrap(CustomTestCase):
         from sglang.srt.runtime_context import publish
         from sglang.srt.server_args import ServerArgs
 
-        publish(ServerArgs(model_path="dummy", kv_cache_dtype="auto"), role="scheduler")
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                kv_cache_dtype="auto",
+                load_balance_method="follow_bootstrap_room",
+            ),
+            role="scheduler",
+        )
         return mgr
 
 

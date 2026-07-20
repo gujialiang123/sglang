@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.runtime_context import get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 
@@ -56,8 +55,10 @@ class HttpServerEngineAdapter(EngineBase):
 
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
+        # Read host/port from the adapter's own args: no config is published yet
+        # in this process (publish happens in the child from launch_server_process).
         print(
-            f"Launch HttpServerEngineAdapter at: {get_serving().host}:{get_serving().port}"
+            f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
         )
         self.process = launch_server_process(self.server_args)
 

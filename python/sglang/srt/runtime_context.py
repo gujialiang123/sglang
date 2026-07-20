@@ -810,8 +810,11 @@ class RuntimeContext:
         self._overrides_log.append((source, dict(fields)))
 
     def overrides_log(self) -> list:
-        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``."""
-        return list(self._overrides_log)
+        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``.
+
+        Returns deep-ish copies (source, dict(fields)) so callers inspecting the
+        log cannot mutate the recorded provenance in place."""
+        return [(source, dict(fields)) for source, fields in self._overrides_log]
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
         """Test-only scoped override for the config tier — the sibling of
@@ -843,13 +846,21 @@ class _ServerArgsOverride:
     nondeterministic point.
     """
 
-    __slots__ = ("_context", "_fields", "_previous", "_previous_capture", "_installed")
+    __slots__ = (
+        "_context",
+        "_fields",
+        "_prev_server_args",
+        "_prev_bags",
+        "_prev_overrides_log",
+        "_prev_publish_role",
+        "_prev_parallel_config",
+        "_prev_capture",
+        "_installed",
+    )
 
     def __init__(self, context: RuntimeContext, fields: dict):
         self._context = context
         self._fields = fields
-        self._previous: ServerArgs | None = None
-        self._previous_capture = False
         self._installed = False
 
     def install(self) -> ServerArgs:
@@ -859,8 +870,18 @@ class _ServerArgsOverride:
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
-        self._previous = self._context._server_args
-        self._previous_capture = self._context.flags.capture.enable_torch_compile
+        # Snapshot the ENTIRE pre-install lifecycle state so restore() reinstates
+        # it verbatim: reseeding only ``_server_args`` would leave the projected
+        # bags / parallel leaves / provenance from this override live after the
+        # scope (violating fail-closed and leaking config into later tests), and
+        # would also drop any outer override that was active before this one.
+        ctx = self._context
+        self._prev_server_args = ctx._server_args
+        self._prev_bags = ctx._config_bags
+        self._prev_overrides_log = ctx._overrides_log
+        self._prev_publish_role = ctx._publish_role
+        self._prev_parallel_config = ctx.parallel._config
+        self._prev_capture = ctx.flags.capture.enable_torch_compile
         server_args = ServerArgs(model_path="dummy")
         if self._fields:
             server_args.override(source="test-override", **self._fields)
@@ -869,24 +890,26 @@ class _ServerArgsOverride:
         # materialized so bare post-publish writes raise like they do on a
         # fully resolved config.
         object.__setattr__(server_args, "_declarations_materialized", True)
-        self._context.set_server_args(server_args)
+        ctx.set_server_args(server_args)
         self._installed = True
         return server_args
 
     def restore(self) -> None:
-        """Reinstate the previously published config (or the empty slot)."""
+        """Reinstate the exact pre-install lifecycle state (or the empty slot)."""
         if not self._installed:
             return
         self._installed = False
-        previous, self._previous = self._previous, None
-        if previous is None:
-            self._context._server_args = None
-        else:
-            self._context.set_server_args(previous)
-        # set_server_args reseeds the capture tier from the published object
-        # (and the empty-slot path does not touch it at all); the snapshot
-        # puts back the exact pre-install runtime state either way.
-        self._context.flags.capture.enable_torch_compile = self._previous_capture
+        ctx = self._context
+        ctx._server_args = self._prev_server_args
+        ctx._config_bags = self._prev_bags
+        ctx._overrides_log = self._prev_overrides_log
+        ctx._publish_role = self._prev_publish_role
+        ctx.parallel._config = self._prev_parallel_config
+        ctx.flags.capture.enable_torch_compile = self._prev_capture
+        self._prev_server_args = None
+        self._prev_bags = None
+        self._prev_overrides_log = None
+        self._prev_parallel_config = None
 
     def __enter__(self) -> ServerArgs:
         return self.install()

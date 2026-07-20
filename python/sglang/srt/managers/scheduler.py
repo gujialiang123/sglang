@@ -798,7 +798,12 @@ class Scheduler(
         )
 
         if get_spec().speculative_draft_load_format is not None:
-            get_context().override(
+            # Write the draft load_format onto server_args (not just the bag):
+            # the draft worker is built from a copy of self.server_args and
+            # build_load_config reads server_args.load_format, so a bag-only
+            # override would be ignored and the draft would load in the target's
+            # format.
+            self.server_args.override(
                 "scheduler.draft_load_format",
                 load_format=get_spec().speculative_draft_load_format,
             )

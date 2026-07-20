@@ -29,6 +29,18 @@ from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
+
+
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
 # ---------------------------------------------------------------------------
