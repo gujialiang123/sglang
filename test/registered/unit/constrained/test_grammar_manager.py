@@ -18,6 +18,8 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
@@ -32,14 +34,31 @@ register_cpu_ci(2.0, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    """Each test publishes its own config context; reset it afterwards so the
+    published bags never leak across tests."""
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
+
+
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     """Create a mock scheduler with necessary attributes."""
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import ServerArgs
+
+    # Config is read through the published namespace bags, so seed a real
+    # (resolved) ServerArgs rather than a bare mock.
+    server_args = ServerArgs(
+        model_path="dummy",
+        grammar_backend=grammar_backend_name,
+        skip_tokenizer_init=skip_tokenizer,
+    )
+    publish(server_args, role="scheduler")
     scheduler = MagicMock()
-    scheduler.server_args.grammar_backend = grammar_backend_name
-    scheduler.server_args.skip_tokenizer_init = skip_tokenizer
-    scheduler.server_args.reasoning_parser = None
-    scheduler.server_args.constrained_json_whitespace_pattern = None
-    scheduler.server_args.constrained_json_disable_any_whitespace = False
+    scheduler.server_args = server_args
 
     # Distributed group mocks
     scheduler.dp_tp_cpu_group = MagicMock()

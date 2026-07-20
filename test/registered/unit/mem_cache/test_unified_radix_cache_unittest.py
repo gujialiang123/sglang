@@ -69,6 +69,17 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
+
+
 @dataclass(frozen=True)
 class CacheConfig:
     # Tree
@@ -891,7 +902,9 @@ class UnifiedRadixCacheSuite:
             req.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
-        get_server_args().strip_thinking_cache = True
+        from sglang.srt.runtime_context import get_context
+
+        get_context().override("test.strip_thinking", strip_thinking_cache=True)
         try:
             avail_before = allocator.available_size()
             cache.cache_finished_req(
@@ -899,7 +912,7 @@ class UnifiedRadixCacheSuite:
             )
             start_p, end_p = req.effective_kv_committed_len(), req.kv.kv_allocated_len
         finally:
-            get_server_args().strip_thinking_cache = False
+            get_context().override("test.strip_thinking", strip_thinking_cache=False)
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:

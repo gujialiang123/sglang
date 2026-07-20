@@ -59,6 +59,17 @@ def _resolve(stub, hybrid=False):
         return stub._resolve_max_running_requests()
 
 
+def _publish_stub_config(**fields):
+    """Publish a base resolved config and override the exact stub values so the
+    runtime-context reads (get_schedule()/get_memory()/get_exec()) resolve to the
+    values the test set, bypassing ServerArgs.__post_init__ resolution."""
+    from sglang.srt.runtime_context import get_context, publish
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy"), role="scheduler")
+    get_context().override("mlx_stub", **fields)
+
+
 def _stub(
     max_running_requests,
     max_total_num_tokens,
@@ -76,6 +87,14 @@ def _stub(
     )
     stub.max_total_num_tokens = max_total_num_tokens
     stub.dp_size = dp_size
+    # _resolve_max_running_requests reads these through the published config bags
+    # (get_schedule()/get_memory()); override to the exact stub values so the
+    # resolver sees them verbatim (not ServerArgs.__post_init__-resolved).
+    _publish_stub_config(
+        max_running_requests=max_running_requests,
+        max_mamba_cache_size=max_mamba_cache_size,
+        disable_radix_cache=disable_radix_cache,
+    )
     return stub
 
 
@@ -102,6 +121,12 @@ def _hybrid_stub_for_initialize(
         num_attention_layers=1,
         context_len=64,
         use_ngram_embedding=False,  # short-circuits NgramEmbeddingManager
+    )
+    _publish_stub_config(
+        enable_memory_saver=False,
+        max_running_requests=max_running_requests,
+        max_mamba_cache_size=max_mamba_cache_size,
+        disable_radix_cache=disable_radix_cache,
     )
     return stub
 

@@ -409,6 +409,11 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
 
 class TestDecodePrebuiltPriority(unittest.TestCase):
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
+        # get_new_prebuilt_batch reads get_disagg() from the published config.
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False

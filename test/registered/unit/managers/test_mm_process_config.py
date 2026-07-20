@@ -1,12 +1,21 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
 
 
 class TestMmProcessConfigValidation(unittest.TestCase):
@@ -69,9 +78,15 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
 
-        server_args = MagicMock()
-        server_args.mm_process_config = mm_process_config
+        # mm config is read through the published bag (get_mm()), so seed a real
+        # resolved ServerArgs instead of a bare mock.
+        server_args = ServerArgs(
+            model_path="dummy", mm_process_config=mm_process_config
+        )
+        publish(server_args, role="scheduler")
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -107,7 +122,12 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
 class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
     @staticmethod
     def _server_args(mm_feature_transport):
-        return SimpleNamespace(
+        from sglang.srt.runtime_context import publish
+
+        # Transport policy resolves from the published config bag (get_mm()),
+        # so seed a real resolved ServerArgs.
+        server_args = ServerArgs(
+            model_path="dummy",
             mm_feature_transport=mm_feature_transport,
             keep_mm_feature_on_device=False,
             disable_fast_image_processor=False,
@@ -116,6 +136,8 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
             tokenizer_worker_num=1,
             base_gpu_id=2,
         )
+        publish(server_args, role="scheduler")
+        return server_args
 
     @staticmethod
     def _processor():
@@ -377,12 +399,16 @@ class TestDoubleBosGuard(unittest.TestCase):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
+        from sglang.srt.runtime_context import publish
 
-        server_args = MagicMock()
-        server_args.mm_process_config = {}
-        server_args.mm_feature_transport = "cpu"
-        server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = True
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_process_config={},
+            mm_feature_transport="cpu",
+            disable_fast_image_processor=True,
+            keep_mm_feature_on_device=True,
+        )
+        publish(server_args, role="scheduler")
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"

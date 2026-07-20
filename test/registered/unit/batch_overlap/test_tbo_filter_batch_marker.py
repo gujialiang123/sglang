@@ -6,12 +6,9 @@ crashed TBO cuda-graph capture until reset. CPU-only.
 """
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
-import sglang.srt.batch_overlap.two_batch_overlap as tbo
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -19,6 +16,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
 
 
 def _make_target_verify_batch(bs: int) -> ForwardBatch:
@@ -37,10 +45,16 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 
 
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
-    fake_args = SimpleNamespace(moe_dense_tp_size=None, attention_backend="fa3")
-    with get_parallel().override(attn_tp_size=1), patch.object(
-        tbo, "get_server_args", lambda: fake_args
-    ):
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import ServerArgs
+
+    # filter_batch resolves moe_dense_tp_size / attention_backend from the
+    # published config bags, so seed a real resolved ServerArgs.
+    publish(
+        ServerArgs(model_path="dummy", moe_dense_tp_size=None, attention_backend="fa3"),
+        role="scheduler",
+    )
+    with get_parallel().override(attn_tp_size=1):
         return TboForwardBatchPreparer.filter_batch(
             batch,
             start_token_index=lo,

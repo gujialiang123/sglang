@@ -33,8 +33,10 @@ def test_down_moe_reuses_tuned_up_config_when_separate_config_is_absent(
     monkeypatch.setattr(fused_moe_triton_config.triton, "__version__", "3.6.0")
     monkeypatch.setattr(
         fused_moe_triton_config,
-        "get_server_args",
-        lambda: SimpleNamespace(enable_deterministic_inference=False),
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False)
+        ),
     )
     monkeypatch.setattr(
         fused_moe_triton_config,

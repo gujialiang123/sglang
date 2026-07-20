@@ -17,6 +17,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
+
+
 @contextlib.contextmanager
 def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
     """Mock GPU-dependent functions for CPU-only testing.
@@ -120,6 +131,13 @@ def _make_model_runner(
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
     mr.server_args = sa
+
+    # Configurators read kv_cache_dtype through the published model bag
+    # (get_model()), so seed a real resolved ServerArgs for that read.
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy", kv_cache_dtype="auto"), role="scheduler")
 
     spec = MagicMock()
     spec.is_eagle.return_value = False

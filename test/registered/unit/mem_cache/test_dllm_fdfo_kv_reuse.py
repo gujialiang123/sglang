@@ -118,15 +118,19 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             size=8, max_context_len=64, device="cpu", enable_memory_saver=False
         )
         self._old_support_triton = allocation.support_triton
-        self._old_get_server_args = allocation.get_server_args
         allocation.support_triton = lambda _: False
-        allocation.get_server_args = lambda: SimpleNamespace(
-            attention_backend="torch_native", dcp_size=1
+        # allocation resolves attention_backend/dcp_size through the published
+        # config bags (get_exec()/get_parallel()), so seed a real ServerArgs.
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        publish(
+            ServerArgs(model_path="dummy", attention_backend="torch_native"),
+            role="scheduler",
         )
 
     def tearDown(self):
         allocation.support_triton = self._old_support_triton
-        allocation.get_server_args = self._old_get_server_args
 
     def test_alloc_for_extend_mixed_reuse_allocates_only_fresh_and_writes_rows(self):
         allocator = _FakeAllocator(base=200)

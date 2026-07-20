@@ -4,6 +4,18 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_context():
+    from sglang.srt.runtime_context import reset_context
+
+    yield
+    reset_context()
+
+
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -272,6 +284,12 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.server_args.load_balance_method = "follow_bootstrap_room"
         mgr.server_args.port = 30000
 
+        # register_to_bootstrap reads kv_cache_dtype via the published model bag
+        # (get_model()), so seed a real resolved ServerArgs for that read.
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        publish(ServerArgs(model_path="dummy", kv_cache_dtype="auto"), role="scheduler")
         return mgr
 
 

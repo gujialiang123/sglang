@@ -118,6 +118,13 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+
+    # TokenizerManager reads resolved config through the published namespace bags
+    # (get_serving()/...); seed a real resolved ServerArgs so those reads resolve.
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy", weight_version="1"), role="tokenizer")
     return tm
 
 
