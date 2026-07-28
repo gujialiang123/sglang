@@ -1076,16 +1076,49 @@ class Gemma3RMSNorm(MultiPlatformOp):
             return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
         return self.forward_native(x)
 
+    def _fused_weight(self, x: torch.Tensor) -> torch.Tensor:
+        """Weight matching the activation's dtype and device, materialised once.
+
+        `self.weight` is `nn.Parameter(torch.zeros(dim))`, so its dtype follows
+        whatever default is in effect when the module is built. Under the
+        loader's `set_default_torch_dtype` that matches the activations, but a
+        module constructed outside that context keeps an fp32 weight, and the
+        fused kernels do not raise on a dtype mismatch -- they return NaNs.
+        Cached on (dtype, device) so a module that is moved or re-cast is not
+        served a stale buffer.
+        """
+        cached = getattr(self, "_fused_weight_cache", None)
+        if (
+            cached is not None
+            and cached.dtype == x.dtype
+            and cached.device == x.device
+        ):
+            return cached
+        w = self.weight.data
+        if w.dtype != x.dtype or w.device != x.device:
+            w = w.to(device=x.device, dtype=x.dtype)
+        w = w.contiguous()
+        self._fused_weight_cache = w
+        return w
+
     def forward_cuda(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None:
             # The decoder residual is token-major and contiguous. The fused
             # kernel updates both tensors in place: x becomes the normalized
             # output and residual becomes x + residual for the next layer.
-            gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
+            gemma_fused_add_rmsnorm(x, residual, self._fused_weight(x), self.eps)
             return x, residual
+        if x.shape[-1] != self.weight.numel():
+            return self.forward_native(x)
         if x.dim() == 2:
-            return gemma_rmsnorm(x, self.weight.data, self.eps)
-        return self.forward_native(x)
+            return gemma_rmsnorm(x, self._fused_weight(x), self.eps)
+        # q_norm / k_norm are called with [tokens, heads, head_dim]. RMSNorm
+        # reduces over the last dimension only, so flattening the leading
+        # dimensions and restoring the shape afterwards is exact.
+        flat = x.reshape(-1, x.shape[-1])
+        if not flat.is_contiguous():
+            flat = flat.contiguous()
+        return gemma_rmsnorm(flat, self._fused_weight(x), self.eps).view_as(x)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None:
