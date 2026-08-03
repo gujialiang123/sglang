@@ -25,6 +25,12 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.lfm2_fusion import (
+    fused_gate_mul,
+    fused_gate_transpose,
+    fused_moesum_add_rmsnorm,
+    fused_transpose_gate,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -36,7 +42,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -49,6 +55,46 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+
+try:
+    from sgl_kernel import fused_qk_norm_rope as _fused_qk_norm_rope
+except ImportError:  # sgl_kernel not built (e.g. CPU-only) -- use the stock path
+    _fused_qk_norm_rope = None
+
+# Below this token count the fused short-conv kernels lose to the stock
+# elementwise ops: the work per launch is too small to amortise the ~30 us
+# Triton launch floor and a 64x64 tile is mostly masked. Measured crossover is
+# between T=1024 (0.94x) and T=2048 (1.29x).
+CONV_FUSION_MIN_TOKENS = 2048
+
+# The fused MoE-reduction kernel saves a launch plus one HBM round trip, so it
+# wins where those dominate: decode (T<=32, up to 2.68x) and long prefill
+# (T>=4096). Between those the stock CUDA reducer is faster (0.72-0.74x), so the
+# stock path is kept there. Note this is the opposite shape dependence to
+# CONV_FUSION_MIN_TOKENS above.
+MOESUM_FUSION_MIN_TOKENS = 4096
+
+
+def _use_moesum_fusion(tokens: int) -> bool:
+    return tokens <= 32 or tokens >= MOESUM_FUSION_MIN_TOKENS
+
+
+def _set_moe_no_combine(experts: "FusedMoE", enabled: bool) -> None:
+    """Toggle FusedMoE between reducing internally and returning raw partials.
+
+    The original flags are captured on first use so the stock behaviour can be
+    restored exactly when the shape guard sends a forward down the stock path.
+    """
+    cfg = experts.moe_runner_config
+    original = getattr(experts, "_lfm_moe_combine_config", None)
+    if original is None:
+        original = (cfg.inplace, cfg.no_combine)
+        experts._lfm_moe_combine_config = original
+    if enabled:
+        cfg.inplace = False
+        cfg.no_combine = True
+    else:
+        cfg.inplace, cfg.no_combine = original
 
 
 class Lfm2MoeMLP(nn.Module):
@@ -156,17 +202,45 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Optimized expert forward pass using FusedMoE."""
+        """Optimized expert forward pass using FusedMoE.
+
+        Returns either the reduced ``[T, H]`` activation, or -- when the fused
+        reduction path is taken -- the un-combined ``[T, top_k, H]`` expert
+        outputs, which the caller folds into the next residual-add RMSNorm.
+        """
         # Get router logits
         router_logits, _ = self.gate(hidden_states)
 
         # Select top-k experts with sigmoid scoring
         topk_output = self.topk(hidden_states, router_logits)
 
+        # Defer the top-k reduction into the next norm when that is profitable.
+        # The scaling factor must be 1.0 for this: the fused kernel reduces and
+        # normalises in one pass and has nowhere to apply a scale.
+        use_fused_reduction = self.routed_scaling_factor == 1.0 and _use_moesum_fusion(
+            hidden_states.shape[0]
+        )
+        _set_moe_no_combine(self.experts, use_fused_reduction)
+
         # Run fused expert computation
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        # Apply routed scaling factor (see __init__ comment for why not in FusedMoE)
+        if use_fused_reduction:
+            if final_hidden_states.ndim != 3 or final_hidden_states.shape[1] != 4:
+                raise RuntimeError(
+                    "expected un-combined FusedMoE output [T,4,H], got "
+                    f"{tuple(final_hidden_states.shape)}"
+                )
+            return final_hidden_states
+
+        # Apply routed scaling factor (see __init__ comment for why not in
+        # FusedMoE). LFM2.5 ships routed_scaling_factor == 1.0, in which case
+        # this is a full-tensor elementwise multiply by one -- 22 no-op kernel
+        # launches per forward, each reading and rewriting the whole [T, H]
+        # activation. Skipping it is bit-exact: a finite bf16 value times 1.0 is
+        # itself.
+        if self.routed_scaling_factor == 1.0:
+            return final_hidden_states
         return final_hidden_states * self.routed_scaling_factor
 
 
@@ -223,6 +297,11 @@ class Lfm2MoeAttention(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=config.norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=config.norm_eps)
 
+        # `fused_qk_norm_rope` bakes in plain (non-scaled) RoPE, so only take
+        # that path when `get_rope` returned the unscaled implementation.
+        self.rope_theta = rope_theta
+        self._can_fuse_qk_rope = type(self.rotary_emb) is RotaryEmbedding
+
         self.num_local_q_heads = self.qkv_proj.num_heads
         self.num_local_kv_heads = self.qkv_proj.num_kv_heads
 
@@ -246,6 +325,46 @@ class Lfm2MoeAttention(nn.Module):
 
         q_size = self.num_local_q_heads * self.head_dim
         kv_size = self.num_local_kv_heads * self.head_dim
+
+        # `sgl_kernel.fused_qk_norm_rope` combines both head-wise RMSNorms and
+        # RoPE into a single in-place kernel over the packed QKV tensor.
+        # Qwen3-MoE already calls it; the unfused chain below costs 1.65 % of
+        # decode and 3.61 % of prefill kernel time here.
+        #
+        # With plain RoPE the yarn parameters degenerate to the identity
+        # (factor 1, no ramp). The kernel supports head_dim 64 in bf16; anything
+        # else falls through to the stock path below.
+        if (
+            _fused_qk_norm_rope is not None
+            and self._can_fuse_qk_rope
+            and qkv.dtype == torch.bfloat16
+            and self.head_dim == 64
+        ):
+            pos = (
+                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
+            )
+            _fused_qk_norm_rope(
+                qkv,
+                self.num_local_q_heads,
+                self.num_local_kv_heads,
+                self.num_local_kv_heads,
+                self.head_dim,
+                self.q_layernorm.variance_epsilon,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.rope_theta,
+                self.rotary_emb.is_neox_style,
+                pos,
+                1.0,
+                0,
+                0,
+                1.0,
+            )
+            q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+            attn_out = self.attn(q, k, v, forward_batch)
+            out, _ = self.out_proj(attn_out)
+            return out
+
         q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
 
         q = q.reshape(T, self.num_local_q_heads, self.head_dim)
@@ -335,10 +454,18 @@ class Lfm2MoeShortConv(nn.Module):
         conv_state = meta.layer_cache.conv[0]
 
         proj, _ = self.in_proj(hidden_states)
-        B_gate, C_gate, x = proj.chunk(3, dim=-1)
-        Bx = B_gate * x
+        H = self.hidden_size_per_partition
 
         if forward_batch.forward_mode.is_decode():
+            # Decode consumes [T, H] directly -- there is no transpose to absorb,
+            # and T is the batch size, so a tiled kernel would only add overhead.
+            # The gate multiply is still worth replacing: `B_gate * x` reads two
+            # strided rows of `proj`, which defeats TensorIterator's
+            # vectorisation and leaves it at roughly half the bandwidth of an
+            # equivalent contiguous multiply.
+            Bx = fused_gate_mul(proj, H)
+            C_gate = proj[:, H : 2 * H]
+
             conv_out = causal_conv1d_update(
                 Bx,
                 conv_state,
@@ -347,10 +474,14 @@ class Lfm2MoeShortConv(nn.Module):
                 activation=None,
                 conv_state_indices=meta.cache_indices,
             )
-        else:
-            Bx_t = Bx.transpose(0, 1).contiguous()
+            output, _ = self.out_proj(C_gate * conv_out)
+            return output
+
+        if hidden_states.shape[0] < CONV_FUSION_MIN_TOKENS:
+            B_gate, C_gate, x = proj.chunk(3, dim=-1)
+            Bx = B_gate * x
             conv_out = causal_conv1d_fn(
-                Bx_t,
+                Bx.transpose(0, 1).contiguous(),
                 self.conv_weight,
                 self.conv_bias,
                 query_start_loc=meta.query_start_loc,
@@ -359,8 +490,29 @@ class Lfm2MoeShortConv(nn.Module):
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
+            output, _ = self.out_proj(C_gate * conv_out)
+            return output
 
-        output, _ = self.out_proj(C_gate * conv_out)
+        # One kernel: read proj, multiply the gate, write [H, T] coalesced.
+        Bx_t = fused_gate_transpose(proj, H)
+
+        conv_out_ht = causal_conv1d_fn(
+            Bx_t,
+            self.conv_weight,
+            self.conv_bias,
+            query_start_loc=meta.query_start_loc,
+            cache_indices=meta.cache_indices,
+            has_initial_state=meta.has_initial_state,
+            conv_states=conv_state,
+            activation=None,
+        )
+
+        # One kernel: tiled transpose of conv_out, multiply by C_gate, write
+        # [T, H]. Note causal_conv1d_fn's output is consumed in its native
+        # [H, T] layout -- the stock path transposes it back with a strided
+        # read, which is the more expensive of the two glue operations.
+        gated = fused_transpose_gate(conv_out_ht, proj, H)
+        output, _ = self.out_proj(gated)
         return output
 
 
@@ -426,20 +578,54 @@ class Lfm2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not forward_batch.forward_mode.is_idle():
+        """Deferred-residual form.
+
+        Invariant: the mathematical activation entering the layer is
+        ``hidden_states + residual`` (or just ``hidden_states`` when residual is
+        None). ``RMSNorm(x, residual)`` performs ``residual += x`` and
+        normalises the updated residual in one kernel, so the separate
+        elementwise add disappears. This is the convention every other SGLang
+        model already uses (see ``models/llama.py``); the stock code here took
+        a ``residual`` argument and overwrote it on the first line, so the
+        threaded value was never used and both adds ran as their own kernels
+        (2 per layer x 24 layers = 48).
+
+        Equivalence to the stock layer, writing ``x`` for the incoming
+        activation::
+
+            stock:  a = op(rms(x));   h1 = a + x;   out = h1 + ffn(rms(h1))
+            here:   r' = x;           n = rms(x);   a = op(n)
+                    r'' = a + x = h1; n2 = rms(h1); returns (ffn(n2), h1)
+
+        and the next layer / final norm consumes ``ffn(n2) + h1`` -- identical.
+
+        When ``hidden_states`` arrives with rank 3 it is the un-combined MoE
+        output from the previous layer; the top-k reduction is then folded into
+        this layer's norm by the fused kernel.
+        """
+        if forward_batch.forward_mode.is_idle():
+            return hidden_states, residual
+
+        if residual is None:
             residual = hidden_states
             normed = self.operator_norm(hidden_states)
-
-            if self.is_attention_layer:
-                hidden_states = self.self_attn(positions, normed, forward_batch)
-            else:
-                hidden_states = self.conv(normed, forward_batch)
-
-            hidden_states = hidden_states + residual
-            hidden_states = hidden_states + self.feed_forward(
-                self.ffn_norm(hidden_states)
+        elif hidden_states.ndim == 3:
+            normed, residual = fused_moesum_add_rmsnorm(
+                hidden_states,
+                residual,
+                self.operator_norm.weight.data,
+                self.operator_norm.variance_epsilon,
             )
+        else:
+            normed, residual = self.operator_norm(hidden_states, residual)
 
+        if self.is_attention_layer:
+            hidden_states = self.self_attn(positions, normed, forward_batch)
+        else:
+            hidden_states = self.conv(normed, forward_batch)
+
+        hidden_states, residual = self.ffn_norm(hidden_states, residual)
+        hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
 
 
@@ -499,7 +685,21 @@ class Lfm2MoeModel(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        return self.embedding_norm(hidden_states)
+        # Settle the deferred residual in the final norm. The last layer may
+        # also hand back un-combined MoE partials, in which case the reduction
+        # is folded in here too.
+        if hidden_states.ndim == 3:
+            hidden_states, _ = fused_moesum_add_rmsnorm(
+                hidden_states,
+                residual,
+                self.embedding_norm.weight.data,
+                self.embedding_norm.variance_epsilon,
+            )
+            return hidden_states
+        if residual is None:
+            return self.embedding_norm(hidden_states)
+        hidden_states, _ = self.embedding_norm(hidden_states, residual)
+        return hidden_states
 
 
 class Lfm2MoeForCausalLM(nn.Module):
